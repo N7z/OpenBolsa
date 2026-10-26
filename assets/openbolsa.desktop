@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=OpenBolsa
+GenericName=Visualizador de ações da B3
+Comment=Histórico de ativos da B3 contra a média de 2 anos
+Exec=openbolsa
+Icon=openbolsa
+Terminal=false
+Categories=Office;Finance;
+Keywords=B3;bolsa;ações;cotação;
+StartupWMClass=openbolsa

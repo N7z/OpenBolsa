@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1f232a"/>
+      <stop offset="1" stop-color="#14161a"/>
+    </linearGradient>
+    <linearGradient id="fill" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#4eaa76" stop-opacity="0.35"/>
+      <stop offset="1" stop-color="#4eaa76" stop-opacity="0"/>
+    </linearGradient>
+  </defs>
+  <rect x="8" y="8" width="240" height="240" rx="52" fill="url(#bg)" stroke="#2a2e36" stroke-width="4"/>
+  <!-- média histórica -->
+  <line x1="40" y1="124" x2="216" y2="124" stroke="#628cc8" stroke-width="8" stroke-linecap="round" stroke-dasharray="4 18"/>
+  <!-- preço: sobe forte, cai abaixo da média -->
+  <path d="M40 176 L76 150 L104 160 L138 92 L164 108 L188 70 L216 150 L216 208 L40 208 Z" fill="url(#fill)"/>
+  <path d="M40 176 L76 150 L104 160 L138 92 L164 108 L188 70 L216 150" fill="none" stroke="#4eaa76" stroke-width="14" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="216" cy="150" r="13" fill="#d0a24a" stroke="#14161a" stroke-width="5"/>
+</svg>

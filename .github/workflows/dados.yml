@@ -1,0 +1,61 @@
+# Gera o mirror do histórico (src/mirror.rs) e publica na release `dados`.
+# O app baixa de https://github.com/<dono>/<repo>/releases/download/dados/manifest.json.
+name: Dados
+
+on:
+  schedule:
+    # O arquivo diário da B3 sai à noite: 23h e, se atrasar, 7h de Brasília (UTC−3).
+    - cron: "0 2 * * 2-6"
+    - cron: "0 10 * * 2-6"
+  workflow_dispatch:
+    inputs:
+      from:
+        description: "Primeiro ano (só na primeira geração ou para refazer tudo)"
+        default: "1986"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: dados
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+
+      - name: Compilar
+        run: cargo build --release --locked
+
+      - name: Baixar o mirror atual
+        run: |
+          mkdir -p mirror
+          if gh release view dados >/dev/null 2>&1; then
+            gh release download dados --dir mirror --clobber
+          else
+            gh release create dados --title "Dados" --latest=false \
+              --notes "Histórico diário das ações da B3 (COTAHIST filtrado), atualizado automaticamente. Veja manifest.json."
+          fi
+          touch mirror/.baixado
+
+      - name: Gerar
+        run: ./target/release/openbolsa --build-mirror mirror --from "${{ inputs.from || '1986' }}"
+
+      # Só os anos refeitos, e antes do manifest: quem baixar no meio do upload ainda vê o anterior.
+      - name: Publicar
+        run: |
+          find mirror -name 'A*.zip' -newer mirror/.baixado -print0 | xargs -0 -r gh release upload dados --clobber
+          gh release upload dados mirror/manifest.json --clobber
