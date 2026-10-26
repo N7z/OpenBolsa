@@ -13,7 +13,7 @@ use egui_plot::{BoxElem, BoxPlot, BoxSpread, HLine, Legend, Line, LineStyle, Plo
 use serde::{Deserialize, Serialize};
 
 use crate::analysis::{self, Metrics};
-use crate::b3::{self, LiveQuote};
+use crate::b3::{self, Intraday, LiveQuote};
 use crate::db::{self, AssetInfo, Bar};
 use crate::live::{self, IBOV};
 use crate::theme::{self, ACCENT, AMBER, GREEN, RED, TEXT, TEXT_STRONG, TEXT_WEAK};
@@ -23,12 +23,17 @@ const FLASH_SECS: f64 = 1.5;
 /// O arquivo diário da B3 sai à noite; a partir dessa hora tenta baixá-lo.
 const DAILY_FILE_HOUR: u32 = 19;
 const SYNC_RETRY: Duration = Duration::from_secs(30 * 60);
+/// Com o pregão aberto, rebusca o gráfico do dia nesse intervalo (a B3 fecha um ponto por minuto).
+const INTRADAY_REFRESH: Duration = Duration::from_secs(60);
+/// Minutos por candle no gráfico do dia.
+const INTRADAY_CANDLE_MIN: u32 = 5;
 
 enum Msg {
     Status(String),
     Loaded(HashMap<String, Vec<Bar>>, HashMap<String, AssetInfo>),
     Error(String),
     Done,
+    Intraday(String, Result<b3::Intraday, String>),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -49,22 +54,64 @@ enum SortCol {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 enum ChartRange {
+    D1,
+    D5,
+    D15,
+    M1,
+    M3,
     M6,
     Y1,
     Y2,
+    Y5,
+    Y10,
+    All,
+}
+
+/// Quanto do histórico um período mostra.
+enum Span {
+    /// Últimos N pregões, contando o de hoje ao vivo.
+    Sessions(usize),
+    Months(u32),
     All,
 }
 
 impl ChartRange {
-    const ALL: [(ChartRange, &str); 4] =
-        [(ChartRange::M6, "6M"), (ChartRange::Y1, "1A"), (ChartRange::Y2, "2A"), (ChartRange::All, "Tudo")];
+    const ALL: [(ChartRange, &str); 11] = [
+        (ChartRange::D1, "1D"),
+        (ChartRange::D5, "5D"),
+        (ChartRange::D15, "15D"),
+        (ChartRange::M1, "1M"),
+        (ChartRange::M3, "3M"),
+        (ChartRange::M6, "6M"),
+        (ChartRange::Y1, "1A"),
+        (ChartRange::Y2, "2A"),
+        (ChartRange::Y5, "5A"),
+        (ChartRange::Y10, "10A"),
+        (ChartRange::All, "Tudo"),
+    ];
 
-    fn months(self) -> Option<u32> {
+    fn span(self) -> Span {
         match self {
-            ChartRange::M6 => Some(6),
-            ChartRange::Y1 => Some(12),
-            ChartRange::Y2 => Some(24),
-            ChartRange::All => None,
+            ChartRange::D1 => Span::Sessions(1),
+            ChartRange::D5 => Span::Sessions(5),
+            ChartRange::D15 => Span::Sessions(15),
+            ChartRange::M1 => Span::Months(1),
+            ChartRange::M3 => Span::Months(3),
+            ChartRange::M6 => Span::Months(6),
+            ChartRange::Y1 => Span::Months(12),
+            ChartRange::Y2 => Span::Months(24),
+            ChartRange::Y5 => Span::Months(60),
+            ChartRange::Y10 => Span::Months(120),
+            ChartRange::All => Span::All,
+        }
+    }
+
+    /// Vai além dos ~3 anos carregados em memória e precisa do histórico completo do banco.
+    fn needs_history(self) -> bool {
+        match self.span() {
+            Span::Sessions(_) => false,
+            Span::Months(m) => m > 36,
+            Span::All => true,
         }
     }
 }
@@ -137,6 +184,10 @@ pub struct App {
     search: String,
     /// Histórico completo do ativo aberto, para o gráfico "Tudo" (`bars` só tem ~40 meses).
     history: Option<(String, Vec<Bar>)>,
+    /// Gráfico do dia (1D) do ativo aberto.
+    intraday: Option<(String, Result<Intraday, String>)>,
+    /// Última busca do gráfico do dia: ticker, quando, e se ainda está em andamento.
+    intraday_fetch: Option<(String, Instant, bool)>,
 }
 
 impl App {
@@ -169,6 +220,8 @@ impl App {
             selected: std::env::args().skip_while(|a| a != "--ticker").nth(1).map(|t| t.to_uppercase()),
             search: String::new(),
             history: None,
+            intraday: None,
+            intraday_fetch: None,
         };
         // Na abertura: mostra o que já está no banco e baixa só os dias que faltam.
         app.spawn_load(cc.egui_ctx.clone(), true);
@@ -231,6 +284,17 @@ impl App {
                 }
                 Msg::Error(e) => self.status = format!("Erro: {e}"),
                 Msg::Done => self.loading = false,
+                Msg::Intraday(t, r) => {
+                    if let Some((ft, _, pending)) = &mut self.intraday_fetch
+                        && *ft == t
+                    {
+                        *pending = false;
+                    }
+                    // Num erro de atualização, mantém o gráfico que já estava na tela.
+                    if r.is_ok() || self.intraday.as_ref().is_none_or(|(it, _)| *it != t) {
+                        self.intraday = Some((t, r));
+                    }
+                }
             }
         }
 
@@ -240,8 +304,12 @@ impl App {
                 live::Event::State(s) => self.live_state = s,
                 live::Event::Quote(t, q) => {
                     let old = if t == IBOV { self.ibov.replace(q.clone()) } else { self.live.insert(t.clone(), q.clone()) };
+                    // Só pisca com negócio novo durante o pregão; fora dele a B3 alterna entre
+                    // servidores dessincronizados e o preço "mudaria" sem nenhum negócio.
                     if let Some(old) = &old
                         && old.price != q.price
+                        && q.quantity > old.quantity
+                        && self.market_open()
                     {
                         self.flashes.insert(t.clone(), (now, q.price > old.price));
                     }
@@ -339,11 +407,20 @@ impl App {
                     ui.label(RichText::new("IBOV").small().color(TEXT_WEAK));
                     ui.separator();
                 }
+                if matches!(self.live_state, live::State::Idle(_)) {
+                    ui.label(RichText::new("Pregão fechado").small().color(TEXT_WEAK));
+                    ui.separator();
+                }
                 if self.ref_date > 0 {
                     ui.label(RichText::new(format!("Fechamento até {}", fmt_date(self.ref_date))).small().color(TEXT_WEAK));
                 }
             });
         });
+    }
+
+    /// O worker está acompanhando um pregão aberto (fora dele só busca o fechamento do dia).
+    fn market_open(&self) -> bool {
+        matches!(self.live_state, live::State::Running { .. })
     }
 
     /// Só aparece quando o ao vivo está com problema.
@@ -434,20 +511,14 @@ impl App {
         ui.add_space(6.0);
 
         let rows = self.filtered();
-        let live_count = rows.iter().filter(|m| m.live).count();
-        ui.horizontal(|ui| {
-            ui.label(RichText::new(format!("{} ativos", rows.len())).strong());
-            if live_count > 0 {
-                ui.weak(format!("· {live_count} com preço ao vivo (●)"));
-            }
-            ui.weak("· linhas destacadas cruzaram abaixo da média hoje");
-        });
+        ui.label(RichText::new(format!("{} ativos", rows.len())).strong());
         ui.add_space(2.0);
+        let live_tip = if self.market_open() { "Preço ao vivo" } else { "Fechamento de hoje, ainda fora do histórico" };
 
         let headers = [
             (SortCol::Ticker, "Ticker", "Código de negociação"),
             (SortCol::Name, "Nome", "Nome resumido (COTAHIST)"),
-            (SortCol::Price, "Preço", "Preço ao vivo (●) ou último fechamento"),
+            (SortCol::Price, "Preço", "Preço de hoje (●) ou último fechamento"),
             (SortCol::Change, "Dia", "Variação do dia"),
             (SortCol::Avg, "Média", "Média simples dos fechamentos dos últimos 2 anos"),
             (SortCol::DistNow, "Dist.", "Distância da média hoje: preço atual / média 2a − 1"),
@@ -464,6 +535,8 @@ impl App {
         let mut toggle_fav = None;
         egui::ScrollArea::horizontal().show(ui, |ui| {
             ui.spacing_mut().item_spacing.x = 6.0;
+            // Texto selecionável captura o clique e mostra o cursor de edição; a linha toda é o botão.
+            ui.style_mut().interaction.selectable_labels = false;
             TableBuilder::new(ui)
                 .striped(true)
                 .sense(egui::Sense::click())
@@ -486,7 +559,7 @@ impl App {
                         }
                         if i == 1 {
                             header.col(|ui| {
-                                ui.label("").on_hover_text("Possível desdobramento/grupamento");
+                                ui.label("").on_hover_text("Cruzou abaixo da média hoje (↓) ou possível desdobramento/grupamento (!)");
                             });
                         }
                         header.col(|ui| {
@@ -506,7 +579,6 @@ impl App {
                 .body(|body| {
                     body.rows(24.0, rows.len(), |mut row| {
                         let m = rows[row.index()];
-                        row.set_selected(m.crossed_below());
                         row.col(|ui| {
                             if star_button(ui, self.s.favorites.contains(&m.ticker)).clicked() {
                                 toggle_fav = Some(m.ticker.clone());
@@ -516,7 +588,10 @@ impl App {
                             ui.label(RichText::new(&m.ticker).strong().color(TEXT_STRONG));
                         });
                         row.col(|ui| {
-                            if !m.events.is_empty() {
+                            if m.crossed_below() {
+                                ui.label(RichText::new("↓").color(RED).strong())
+                                    .on_hover_text("Cruzou abaixo da média de 2 anos hoje");
+                            } else if !m.events.is_empty() {
                                 let dates: Vec<String> = m.events.iter().map(|&d| fmt_date(d)).collect();
                                 ui.label(RichText::new("!").color(AMBER).strong()).on_hover_text(format!(
                                     "Variação > ±40% entre pregões em {}.\nProvável desdobramento/grupamento: média distorcida.",
@@ -533,7 +608,7 @@ impl App {
                             }
                             ui.label(fmt_num(m.price, 2));
                             if m.live {
-                                ui.label(RichText::new("●").size(7.0).color(ACCENT)).on_hover_text("Preço ao vivo");
+                                ui.label(RichText::new("●").size(7.0).color(ACCENT)).on_hover_text(live_tip);
                             }
                         });
                         row.col(|ui| pct_label(ui, Some(m.change_pct / 100.0)));
@@ -553,6 +628,9 @@ impl App {
                         row.col(|ui| {
                             ui.label(fmt_money_short(m.avg_volume));
                         });
+                        if row.response().hovered() {
+                            row.response().ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+                        }
                         if row.response().clicked() {
                             open = Some(m.ticker.clone());
                         }
@@ -586,8 +664,34 @@ impl App {
         }
     }
 
+    /// Busca o gráfico do dia do ativo, e de novo a cada minuto enquanto o pregão estiver aberto.
+    fn ensure_intraday(&mut self, ctx: &egui::Context, ticker: &str) {
+        let stale = match &self.intraday_fetch {
+            Some((t, _, _)) if t != ticker => true,
+            Some((_, _, true)) => false,
+            Some((_, at, false)) => self.market_open() && at.elapsed() >= INTRADAY_REFRESH,
+            None => true,
+        };
+        if self.market_open() {
+            ctx.request_repaint_after(INTRADAY_REFRESH);
+        }
+        if !stale {
+            return;
+        }
+        self.intraday_fetch = Some((ticker.to_string(), Instant::now(), true));
+        let (tx, ticker, ctx) = (self.tx.clone(), ticker.to_string(), ctx.clone());
+        std::thread::spawn(move || {
+            let r = b3::client().and_then(|c| b3::intraday(&c, &ticker)).map_err(|e| format!("{e:#}"));
+            let _ = tx.send(Msg::Intraday(ticker, r));
+            ctx.request_repaint();
+        });
+    }
+
     fn asset_view(&mut self, ui: &mut egui::Ui, ticker: &str) {
-        if self.s.chart_range == ChartRange::All && !self.loading {
+        if self.s.chart_range == ChartRange::D1 {
+            self.ensure_intraday(ui.ctx(), ticker);
+        }
+        if self.s.chart_range.needs_history() && !self.loading {
             self.ensure_history(ticker);
         }
         let Some(bars) = self.bars.get(ticker) else {
@@ -622,7 +726,7 @@ impl App {
                 ui.set_width(ui.available_width());
                 ui.horizontal_wrapped(|ui| {
                     ui.spacing_mut().item_spacing.x = 28.0;
-                    stat(ui, if m.live { "Preço ao vivo" } else { "Último fechamento" }, |ui| {
+                    stat(ui, if !m.live { "Último fechamento" } else if self.market_open() { "Preço ao vivo" } else { "Fechamento de hoje" }, |ui| {
                         let mut price = RichText::new(fmt_num(m.price, 2)).size(18.0).strong().color(TEXT_STRONG);
                         if let Some(c) = price_flash {
                             price = price.background_color(c);
@@ -667,20 +771,38 @@ impl App {
             ui.selectable_value(&mut self.s.chart_kind, ChartKind::Candle, "Candle");
         });
 
+        if self.s.chart_range == ChartRange::D1 {
+            let live_quote = metrics.filter(|m| m.live).and_then(|_| self.live.get(ticker));
+            match &self.intraday {
+                Some((t, Ok(day))) if t == ticker => {
+                    intraday_chart(ui, ticker, day, bars, live_quote.filter(|_| self.market_open()), self.s.chart_kind)
+                }
+                Some((t, Err(e))) if t == ticker => {
+                    ui.colored_label(RED, format!("Gráfico do dia indisponível: {e}"));
+                }
+                _ => {
+                    ui.spinner();
+                    ui.ctx().request_repaint_after(Duration::from_millis(200));
+                }
+            }
+            return;
+        }
+
         let bars = match &self.history {
-            Some((t, h)) if self.s.chart_range == ChartRange::All && t == ticker && h.last().map(|b| b.date) == bars.last().map(|b| b.date) => h,
+            Some((t, h)) if self.s.chart_range.needs_history() && t == ticker && h.last().map(|b| b.date) == bars.last().map(|b| b.date) => h,
             _ => bars,
         };
         let last = bars.last().map(|b| b.date).unwrap_or(0);
-        let from = self
-            .s
-            .chart_range
-            .months()
-            .map(|m| analysis::from_date(analysis::to_date(last) - chrono::Months::new(m)))
-            .unwrap_or(0);
-        // Eixo x por pregão (índice no histórico), sem buracos de fim de semana e feriado.
-        let first = bars.partition_point(|b| b.date < from);
         let live_quote = metrics.filter(|m| m.live).and_then(|_| self.live.get(ticker));
+        // Eixo x por pregão (índice no histórico), sem buracos de fim de semana e feriado.
+        let first = match self.s.chart_range.span() {
+            Span::Sessions(n) => bars.len().saturating_sub(n - usize::from(live_quote.is_some())),
+            Span::Months(m) => {
+                bars.partition_point(|b| b.date < analysis::from_date(analysis::to_date(last) - chrono::Months::new(m)))
+            }
+            Span::All => 0,
+        };
+        let from = bars.get(first).map(|b| b.date).unwrap_or(u32::MAX);
         let now_x = bars.len() as f64;
         let dates: Vec<u32> = bars.iter().map(|b| b.date).collect();
         let date_at = move |x: f64| -> Option<String> {
@@ -738,7 +860,7 @@ impl App {
                         .map(|(i, b)| candle(i as f64, b.open, b.high, b.low, b.close, &fmt_date(b.date)))
                         .collect();
                     if let Some(q) = live_quote {
-                        candles.push(candle(now_x, q.open, q.high, q.low, q.price, "Hoje (ao vivo)"));
+                        candles.push(candle(now_x, q.open, q.high, q.low, q.price, "Hoje"));
                     }
                     plot.box_plot(
                         BoxPlot::new("Candles", candles)
@@ -766,6 +888,92 @@ impl App {
             }
         });
     }
+}
+
+/// Gráfico do pregão minuto a minuto. Os candles são montados agrupando os fechamentos de cada
+/// minuto, já que a B3 não dá abertura/máxima/mínima por minuto.
+fn intraday_chart(
+    ui: &mut egui::Ui,
+    ticker: &str,
+    day: &Intraday,
+    bars: &[Bar],
+    live_quote: Option<&LiveQuote>,
+    kind: ChartKind,
+) {
+    let mut points: Vec<[f64; 2]> = day.points.iter().map(|&(m, p)| [m as f64, p]).collect();
+    // Com o pregão aberto, o preço ao vivo vem antes do próximo ponto fechado da B3.
+    if let Some(q) = live_quote {
+        let now = b3::brt_now();
+        let minute = (now.hour() * 60 + now.minute()) as f64;
+        if analysis::from_date(now.date_naive()) == day.date && points.last().is_none_or(|p| p[0] < minute) {
+            points.push([minute, q.price]);
+        }
+    }
+    if points.is_empty() {
+        ui.label(RichText::new("Sem negócios neste pregão").color(TEXT_WEAK));
+        return;
+    }
+    let prev_close = bars.iter().rev().find(|b| b.date < day.date).map(|b| b.close);
+    if analysis::from_date(b3::brt_now().date_naive()) != day.date {
+        ui.label(RichText::new(format!("Pregão de {}", fmt_date(day.date))).small().color(TEXT_WEAK));
+    }
+
+    let plot = Plot::new(("intraday", ticker))
+        .legend(Legend::default())
+        .grid_color(theme::BORDER.gamma_multiply(1.6))
+        .x_axis_formatter(move |mark, _| fmt_hhmm(mark.value))
+        .label_formatter(move |pos| {
+            let p = match pos {
+                egui_plot::HoverPosition::NearDataPoint { position, .. } => position,
+                egui_plot::HoverPosition::Elsewhere { position } => position,
+            };
+            Some(format!("{}\n{}", fmt_hhmm(p.x), fmt_num(p.y, 2)))
+        });
+    plot.show(ui, |plot| {
+        match kind {
+            ChartKind::Line => {
+                let last = *points.last().unwrap();
+                plot.line(Line::new("Preço", points).width(1.5).color(TEXT));
+                if live_quote.is_some() {
+                    plot.points(Points::new("", vec![last]).radius(4.0).color(AMBER));
+                }
+            }
+            ChartKind::Candle => {
+                let mut candles = Vec::new();
+                let mut open = points[0][1];
+                for chunk in points.chunk_by(|a, b| a[0] as u32 / INTRADAY_CANDLE_MIN == b[0] as u32 / INTRADAY_CANDLE_MIN) {
+                    let start = (chunk[0][0] as u32 / INTRADAY_CANDLE_MIN * INTRADAY_CANDLE_MIN) as f64;
+                    let close = chunk[chunk.len() - 1][1];
+                    let high = chunk.iter().map(|p| p[1]).fold(open, f64::max);
+                    let low = chunk.iter().map(|p| p[1]).fold(open, f64::min);
+                    let x = start + INTRADAY_CANDLE_MIN as f64 / 2.0;
+                    let label = format!("{} – {}", fmt_hhmm(start), fmt_hhmm(start + INTRADAY_CANDLE_MIN as f64));
+                    candles.push(candle(x, open, high, low, close, &label).box_width(INTRADAY_CANDLE_MIN as f64 * 0.7));
+                    open = close;
+                }
+                plot.box_plot(
+                    BoxPlot::new("Candles", candles).color(TEXT).element_formatter(Box::new(|e, _| e.name.clone())),
+                );
+            }
+        }
+        // Sem a média de 2 anos: ela costuma ficar longe e achataria o gráfico do dia.
+        if let Some(c) = prev_close {
+            plot.hline(HLine::new("Fech. anterior", c).color(TEXT_WEAK).style(LineStyle::dotted_dense()));
+        }
+        if let Some(q) = live_quote {
+            plot.hline(
+                HLine::new(format!("Agora {}", fmt_num(q.price, 2)), q.price)
+                    .color(AMBER)
+                    .width(1.5)
+                    .style(LineStyle::dashed_loose()),
+            );
+        }
+    });
+}
+
+fn fmt_hhmm(minutes: f64) -> String {
+    let m = minutes.round().max(0.0) as u32;
+    format!("{:02}:{:02}", m / 60, m % 60)
 }
 
 /// Candle como box plot: corpo entre abertura e fechamento, pavio até máxima e mínima.

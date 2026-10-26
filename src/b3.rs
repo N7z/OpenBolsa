@@ -11,6 +11,7 @@ use crate::{cotahist, db, mirror};
 const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:144.0) Gecko/20100101 Firefox/144.0";
 const HIST_URL: &str = "https://bvmf.bmfbovespa.com.br/InstDados/SerHist";
 const LIVE_URL: &str = "https://cotacao.b3.com.br/mds/api/v1/instrumentQuotation";
+const INTRADAY_URL: &str = "https://cotacao.b3.com.br/mds/api/v1/DailyFluctuationHistory";
 
 /// Primeiro ano com COTAHIST publicado pela B3.
 pub const FIRST_YEAR: i32 = 1986;
@@ -175,6 +176,43 @@ pub fn live_quote(client: &reqwest::blocking::Client, ticker: &str) -> anyhow::R
     parse_live(&resp.error_for_status()?.json()?).ok_or_else(|| anyhow::anyhow!("{ticker}: cotação indisponível"))
 }
 
+/// Preço minuto a minuto do último pregão. A B3 só dá o fechamento de cada minuto.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Intraday {
+    /// Data do pregão, `AAAAMMDD`.
+    pub date: u32,
+    /// (minuto do dia, preço), em ordem.
+    pub points: Vec<(u32, f64)>,
+}
+
+pub fn intraday(client: &reqwest::blocking::Client, ticker: &str) -> anyhow::Result<Intraday> {
+    let resp = client.get(format!("{INTRADAY_URL}/{ticker}")).send()?;
+    let status = resp.status();
+    if status == reqwest::StatusCode::TOO_MANY_REQUESTS || status == reqwest::StatusCode::FORBIDDEN {
+        return Err(Throttled(status).into());
+    }
+    parse_intraday(&resp.error_for_status()?.json()?).ok_or_else(|| anyhow::anyhow!("{ticker}: sem dados do pregão"))
+}
+
+fn parse_intraday(v: &serde_json::Value) -> Option<Intraday> {
+    if v["BizSts"]["cd"].as_str() != Some("OK") {
+        return None;
+    }
+    let date = v["TradgFlr"]["date"].as_str()?.replace('-', "").parse().ok()?;
+    let mut points: Vec<(u32, f64)> = v["TradgFlr"]["scty"]["lstQtn"]
+        .as_array()?
+        .iter()
+        .filter_map(|q| {
+            let t = q["dtTm"].as_str()?;
+            let h: u32 = t.get(..2)?.parse().ok()?;
+            let m: u32 = t.get(3..5)?.parse().ok()?;
+            Some((h * 60 + m, q["closPric"].as_f64()?))
+        })
+        .collect();
+    points.sort_by_key(|p| p.0);
+    Some(Intraday { date, points })
+}
+
 fn parse_live(v: &serde_json::Value) -> Option<LiveQuote> {
     if v["BizSts"]["cd"].as_str() != Some("OK") {
         return None;
@@ -196,6 +234,20 @@ fn parse_live(v: &serde_json::Value) -> Option<LiveQuote> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_intraday() {
+        let v = serde_json::json!({
+            "BizSts": {"cd": "OK"},
+            "TradgFlr": {"date": "2026-10-26", "scty": {"lstQtn": [
+                {"closPric": 53.61, "dtTm": "10:46:00", "prcFlcn": -8.6},
+                {"closPric": 51.31, "dtTm": "10:45:00", "prcFlcn": -12.5}
+            ]}}
+        });
+        let d = parse_intraday(&v).unwrap();
+        assert_eq!(d.date, 20261026);
+        assert_eq!(d.points, vec![(645, 51.31), (646, 53.61)]);
+    }
 
     #[test]
     fn parses_live_quote() {

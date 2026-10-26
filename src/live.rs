@@ -172,6 +172,9 @@ pub fn spawn(control: Arc<Mutex<Control>>, tx: Sender<Event>, wake: impl Fn() + 
                 set_state(&mut last_state, State::Running { cycle: Some(cycle_start.elapsed()) });
                 cycle_start = Instant::now();
                 cycle_changed = false;
+            } else if !open {
+                // A volta fora do pregão só busca o fechamento do dia; não é ao vivo.
+                set_state(&mut last_state, State::Idle("Pregão fechado".into()));
             } else if !matches!(last_state, Some(State::Running { .. })) {
                 set_state(&mut last_state, State::Running { cycle: None });
             }
