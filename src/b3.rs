@@ -69,21 +69,21 @@ pub fn to_date(d: u32) -> Option<NaiveDate> {
     NaiveDate::from_ymd_opt((d / 10000) as i32, (d / 100) % 100, d % 100)
 }
 
-/// Garante os anuais dos últimos 3 anos (2 de média + 1 de folga para o retorno de 12 meses),
-/// ou desde 1986 com `full`, e completa com os arquivos diários que faltam.
-/// Os anuais vêm do mirror; se ele falhar, da B3 direto. Devolve quantos arquivos foram gravados.
-pub fn sync(conn: &mut Connection, full: bool, progress: &dyn Fn(String)) -> anyhow::Result<usize> {
+/// Garante os anuais e completa com os arquivos diários que faltam. Devolve quantos arquivos foram gravados.
+///
+/// Do mirror vem o histórico inteiro, desde 1986. Se ele falhar, a B3 direto só dá os últimos 3 anos
+/// (2 de média + 1 de folga para o retorno de 12 meses): são ~90 MB por ano.
+pub fn sync(conn: &mut Connection, progress: &dyn Fn(String)) -> anyhow::Result<usize> {
     let client = client()?;
     let today = brt_now().date_naive();
     let year = today.year();
-    let first = if full { FIRST_YEAR } else { year - 2 };
     let mut loaded = 0;
 
-    match mirror::sync(&client, conn, first, progress) {
+    match mirror::sync(&client, conn, FIRST_YEAR, progress) {
         Ok(n) => loaded += n,
         Err(e) => {
             progress(format!("Mirror indisponível ({e:#}), baixando da B3…"));
-            for y in first..=year {
+            for y in year - 2..=year {
                 let name = format!("A{y}");
                 if !db::is_loaded(conn, &name)?
                     && db::last_date_in(conn, y)?.is_none()

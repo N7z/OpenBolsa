@@ -64,7 +64,7 @@ Os anuais da B3 trazem todos os mercados (opções, termo, fracionário…) e pe
 - CSV separado por `;`, com cabeçalho: `date;ticker;open;high;low;close;trades;quantity;volume;name;spec;isin`. Preços em R$ já divididos por 100 e pelo FATCOT.
 - O app baixa um ano quando o banco local não tem pregões até o `last_date` dele. Se o mirror falhar, baixa os anuais da B3 direto. Os diários depois do último pregão do mirror vêm sempre da B3.
 - `OPENBOLSA_MIRROR` troca a URL do mirror (vazia desliga).
-- Por padrão só os últimos 3 anos; "Histórico completo" (`--full` na linha de comando) baixa desde 1986. Antes de julho/1994 os preços estão em moedas antigas.
+- Pelo mirror o app baixa sempre o histórico inteiro, desde 1986 (~78 MB; o banco fica com ~240 MB). Pela B3 direto, só os últimos 3 anos. Antes de julho/1994 os preços estão em moedas antigas.
 
 ### 2. Cotação ao vivo da B3 — preço durante o pregão
 

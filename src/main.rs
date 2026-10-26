@@ -43,11 +43,11 @@ fn arg_value(name: &str) -> Option<String> {
 }
 
 /// Sincroniza sem abrir a janela e imprime os ativos que cruzaram abaixo da média.
-/// Com `--full`, baixa o histórico desde 1986. Com `--live`, usa a cotação ao vivo como preço atual.
+/// Com `--live`, usa a cotação ao vivo como preço atual.
 fn sync_cli() -> anyhow::Result<()> {
     let path = db::default_path();
     let mut conn = db::open(&path)?;
-    b3::sync(&mut conn, std::env::args().any(|a| a == "--full"), &|s| eprintln!("{s}"))?;
+    b3::sync(&mut conn, &|s| eprintln!("{s}"))?;
     let since = analysis::from_date(b3::brt_now().date_naive() - chrono::Months::new(40));
     let bars = db::load_bars(&conn, since)?;
     let assets = db::load_assets(&conn)?;

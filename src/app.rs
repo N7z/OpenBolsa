@@ -88,12 +88,9 @@ struct Settings {
     sort_desc: bool,
     chart_range: ChartRange,
     chart_kind: ChartKind,
-    live: bool,
     /// Sempre aparecem na lista (mesmo abaixo da liquidez mínima) e sempre são consultados ao vivo.
     favorites: BTreeSet<String>,
     only_favorites: bool,
-    /// Baixa todos os anos desde 1986, não só os 3 usados nas métricas.
-    full_history: bool,
 }
 
 impl Default for Settings {
@@ -108,10 +105,8 @@ impl Default for Settings {
             sort_desc: false,
             chart_range: ChartRange::Y2,
             chart_kind: ChartKind::Line,
-            live: true,
             favorites: BTreeSet::new(),
             only_favorites: false,
-            full_history: false,
         }
     }
 }
@@ -188,7 +183,6 @@ impl App {
         }
         let tx = self.tx.clone();
         let path = self.db_path.clone();
-        let full = self.s.full_history;
         std::thread::spawn(move || {
             let send = |m: Msg| {
                 let _ = tx.send(m);
@@ -204,7 +198,7 @@ impl App {
                 let mut conn = db::open(&path)?;
                 load(&conn)?;
                 if sync {
-                    let loaded = b3::sync(&mut conn, full, &|s| send(Msg::Status(s)))?;
+                    let loaded = b3::sync(&mut conn, &|s| send(Msg::Status(s)))?;
                     if loaded > 0 {
                         load(&conn)?;
                     }
@@ -285,7 +279,7 @@ impl App {
             self.metrics.iter().filter(|m| m.in_universe(min_volume) || self.s.favorites.contains(&m.ticker)).map(|m| m.ticker.clone()).collect();
         tickers.sort();
         let mut ctl = self.live_ctl.lock().unwrap();
-        ctl.enabled = self.s.live && !self.bars.is_empty();
+        ctl.enabled = !self.bars.is_empty();
         ctl.focus = self.selected.clone();
         if ctl.tickers != tickers {
             ctl.tickers = tickers;
@@ -323,19 +317,7 @@ impl App {
                 {
                     self.spawn_load(ui.ctx().clone(), true);
                 }
-                let full = ui.checkbox(&mut self.s.full_history, "Histórico completo").on_hover_text(
-                    "Baixa todos os pregões desde 1986 (dezenas de MB pelo mirror), para o gráfico \"Tudo\". \
-                     Sem isso, só os últimos 3 anos. Preços não ajustados: antes de 1994 estão em moedas antigas.",
-                );
-                if full.changed() && self.s.full_history {
-                    self.spawn_load(ui.ctx().clone(), true);
-                }
             });
-            ui.checkbox(&mut self.s.live, "Ao vivo").on_hover_text(
-                "Consulta continuamente a cotação dos ativos do universo, um por vez (~3 por segundo), \
-                 durante o pregão. O ativo aberto no gráfico e o IBOV têm prioridade e atualizam a cada \
-                 1–2 s. Fonte: endpoint não oficial do site da B3.",
-            );
             self.live_status(ui);
             if self.loading {
                 ui.spinner();
@@ -366,9 +348,6 @@ impl App {
 
     /// Só aparece quando o ao vivo está com problema.
     fn live_status(&self, ui: &mut egui::Ui) {
-        if !self.s.live {
-            return;
-        }
         match &self.live_state {
             live::State::Off | live::State::Running { .. } | live::State::Idle(_) => {}
             live::State::Backoff { reason, until } => {
